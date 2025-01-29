@@ -6,10 +6,12 @@ use std::process;
 use libc::{kill, SIGTERM, SIGKILL};
 
 #[cfg(target_family = "windows")]
-use windows::{
-    Win32::System::Threading::{OpenProcess, TerminateProcess},
-    Win32::Foundation::CloseHandle,
-    Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS},
+use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+#[cfg(target_family = "windows")]
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(target_family = "windows")]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
 
 fn main() -> io::Result<()> {
@@ -32,6 +34,15 @@ fn main() -> io::Result<()> {
 }
 
 fn display_processes() {
+    #[cfg(target_family = "unix")]
+    display_processes_unix();
+
+    #[cfg(target_family = "windows")]
+    display_processes_windows();
+}
+
+#[cfg(target_family = "unix")]
+fn display_processes_unix() {
     println!("{:<10} {:<25} {:<15}", "PID", "Process Name", "Memory (KB)");
     println!("========================================================");
 
@@ -61,6 +72,43 @@ fn display_processes() {
                 }
             }
         }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn display_processes_windows() {
+    println!("{:<10} {:<25}", "PID", "Process Name");
+    println!("===========================================");
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_err() {
+            eprintln!("Failed to create process snapshot.");
+            return;
+        }
+        let snapshot = snapshot.unwrap();
+
+        let mut entry = PROCESSENTRY32::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        // Check if Process32First succeeded
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                let process_name = String::from_utf16_lossy(
+                    &entry.szExeFile.iter().take_while(|&&c| c != 0).map(|&c| c as u16).collect::<Vec<_>>(),
+                );
+                println!("{:<10} {:<25}", entry.th32ProcessID, process_name);
+
+                // Check if Process32Next succeeded
+                if Process32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        } else {
+            eprintln!("Failed to read first process.");
+        }
+
+        CloseHandle(snapshot);
     }
 }
 
@@ -102,19 +150,20 @@ fn terminate_all_processes() {
 
 #[cfg(target_family = "windows")]
 fn terminate_process(pid: i32) {
-    use windows::Win32::Foundation::HANDLE;
-
     unsafe {
-        let handle: HANDLE = OpenProcess(0x0001, false, pid as u32);
-        if !handle.is_invalid() {
-            if TerminateProcess(handle, 0) != 0 {
-                println!("Process {} terminated successfully.", pid);
-            } else {
-                eprintln!("Failed to terminate process {}.", pid);
+        let handle: Result<HANDLE, _> = OpenProcess(PROCESS_TERMINATE, false, pid as u32);
+        match handle {
+            Ok(handle) => {
+                if TerminateProcess(handle, 0).is_ok() {
+                    println!("Process {} terminated successfully.", pid);
+                } else {
+                    eprintln!("Failed to terminate process {}.", pid);
+                }
+                CloseHandle(handle).expect("Failed to close handle");
             }
-            CloseHandle(handle);
-        } else {
-            eprintln!("Unable to open process {}.", pid);
+            Err(_) => {
+                eprintln!("Unable to open process {}.", pid);
+            }
         }
     }
 }
@@ -123,26 +172,25 @@ fn terminate_process(pid: i32) {
 fn terminate_all_processes() {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_invalid() {
-            eprintln!("Failed to create process snapshot.");
-            return;
-        }
+        if let Ok(snapshot) = snapshot {
+            let mut entry = PROCESSENTRY32::default();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
 
-        let mut entry = PROCESSENTRY32::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-
-        if Process32First(snapshot, &mut entry).as_bool() {
-            loop {
-                let pid = entry.th32ProcessID as i32;
-                if pid > 4 { // Avoid terminating system processes
-                    terminate_process(pid);
-                }
-                if !Process32Next(snapshot, &mut entry).as_bool() {
-                    break;
+            if Process32First(snapshot, &mut entry).is_ok() {
+                loop {
+                    let pid = entry.th32ProcessID as i32;
+                    if pid > 4 { // Avoid terminating system processes
+                        terminate_process(pid);
+                    }
+                    if Process32Next(snapshot, &mut entry).is_err() {
+                        break;
+                    }
                 }
             }
-        }
 
-        CloseHandle(snapshot);
+            CloseHandle(snapshot).expect("Failed to close snapshot handle");
+        } else {
+            eprintln!("Failed to create process snapshot.");
+        }
     }
 }
